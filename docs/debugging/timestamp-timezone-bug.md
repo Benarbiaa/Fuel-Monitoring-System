@@ -115,9 +115,13 @@ correct: `16:00+01:00` and `15:00Z` denote the *exact same instant* — the
 value is now round-tripping through a session-timezone-aware display
 format rather than a silently-stripped one. The bug was never about the
 displayed hour; it was about that offset being **dropped** rather than
-**shown**. This is tracked as a follow-up polish item (normalize all API
-responses to UTC for a cleaner, locale-independent contract) rather than a
-remaining bug — see "Known Limitations" in the README.
+**shown**.
+
+It was still worth normalizing, since the offset in API responses depended
+on whichever timezone the database server happened to run in. That
+follow-up is done: the engine now pins every Postgres session to UTC
+(`options=-c timezone=UTC` in `backend/database/database.py`), so the same
+reading now comes back as `15:00:00Z`, regardless of server locale.
 
 ## Takeaway
 

@@ -16,10 +16,14 @@ SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./sql_app.db")
 # 2. Create the engine.
 # check_same_thread=False is only needed/valid for SQLite; Postgres doesn't
 # accept that connect arg, so it's only passed when we're actually on SQLite.
+# On Postgres, pin the session timezone to UTC: TIMESTAMPTZ values are stored
+# as UTC but returned in the session's timezone, which otherwise defaults to
+# the server's local one (e.g. "+01:00" for Africa/Tunis). This keeps API
+# timestamps in UTC regardless of where the database runs.
 connect_args = (
     {"check_same_thread": False}
     if SQLALCHEMY_DATABASE_URL.startswith("sqlite")
-    else {}
+    else {"options": "-c timezone=UTC"}
 )
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args=connect_args)
 

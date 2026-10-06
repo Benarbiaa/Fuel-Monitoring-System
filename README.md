@@ -310,7 +310,6 @@ The chat agent (`chat/services/gemini_service.py`) has access to these tools, di
 - **`/report` makes a live, uncached Groq API call every time it's hit** — repeated requests (e.g. tab switches) each trigger a fresh LLM call. Worth caching by station_id with a short TTL if cost/latency becomes a concern.
 - **Stuck alerts on repeated LLM failures** — see "Automation Agent" above.
 - **Kafka runs as a single broker with `replication.factor=1` everywhere**, including its internal topics — correct and necessary for a one-node local dev setup, but not representative of how a production cluster would be configured (see the ADR's "Known gotcha" section for why this specific setting matters).
-- **API timestamps are returned in the server's local timezone offset, not normalized to UTC** — e.g. a UTC-submitted reading may come back as `...+01:00` rather than `...Z`. The underlying value is correct (Postgres stores `TIMESTAMPTZ`, true UTC internally), but this is worth normalizing at the API boundary for a cleaner, less locale-dependent contract. See `docs/debugging/timestamp-timezone-bug.md` for the full story of how a related bug was found and fixed.
 - Frontend has known `npm audit` findings inherited from the Angular 16 dependency tree (54 vulnerabilities at last check, mostly transitive). Not urgent, but worth revisiting during a future Angular upgrade.
 
 ---
