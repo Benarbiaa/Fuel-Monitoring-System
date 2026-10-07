@@ -174,7 +174,9 @@ class StationAgent:
     def _send_http(self, payload: dict, sales: float, price: float):
         try:
             response = requests.post(f"{BASE_URL}/ingest", json=payload, timeout=10)
-            if response.status_code in (200, 201):
+            # /ingest answers 202 Accepted once Kafka has the reading (it is
+            # stored by the ingestion consumer moments later), not 200/201.
+            if response.status_code == 202:
                 print(
                     f"[{self.station_id}/{payload['fuel_type']}] "
                     f"Sent: {sales:.1f}L sold | Stock: {payload['stock_liters']:.1f}L | "
