@@ -14,9 +14,11 @@ from __future__ import annotations
 import json
 import logging
 import signal
+import time
 
-from confluent_kafka import Consumer, Producer, KafkaError
+from confluent_kafka import Consumer, Producer, KafkaError, TopicPartition
 from pydantic import ValidationError
+from sqlalchemy.exc import OperationalError
 
 from backend.database.database import SessionLocal
 from backend.schemas import FuelData as FuelDataSchema
@@ -35,6 +37,18 @@ DLQ_TOPIC = "fuel.readings.dlq"
 # here would make every restart look like a brand-new consumer with no
 # history, defeating the point of committed offsets.
 GROUP_ID = "ingestion-consumer"
+
+# Retry policy for messages that fail to process (see process_message).
+# Transient database errors are retried forever — the data is valid and
+# must not be lost. Any other error is retried MAX_ATTEMPTS times, then the
+# message is treated as a poison message and routed to the DLQ, so one bad
+# message can't block every later reading on its partition forever.
+MAX_ATTEMPTS = 5
+# Waits between retries double each time (1s, 2s, 4s, ...) up to this cap.
+# Kept well under max.poll.interval.ms (5 min by default): if poll() isn't
+# called within that window, Kafka assumes this consumer is dead and
+# removes it from the group.
+BACKOFF_MAX_SECONDS = 30
 
 
 def _send_to_dlq(dlq_producer: Producer, key, raw_value: bytes, error: str) -> None:
@@ -55,16 +69,18 @@ def _send_to_dlq(dlq_producer: Producer, key, raw_value: bytes, error: str) -> N
     dlq_producer.poll(0)
 
 
-def process_message(msg, dlq_producer: Producer) -> bool:
+def process_message(msg, dlq_producer: Producer, attempt: int = 1) -> bool:
     """
     Handles one Kafka message end to end: validate, write, generate alerts.
 
+    `attempt` is 1 the first time a message is seen and goes up by one on
+    every retry of that same message (see main()).
+
     Returns True if this message's offset should be committed — meaning
-    "we're done with this message, move on" — which covers two distinct
-    outcomes: it was processed successfully, OR it was permanently invalid
-    and has been routed to the DLQ. Returns False only for transient
-    failures (e.g. the database is briefly unreachable), meaning "leave
-    this uncommitted so it gets redelivered and retried later."
+    "we're done with this message, move on" — which covers three outcomes:
+    it was processed successfully, it was permanently invalid and has been
+    routed to the DLQ, or it kept failing for MAX_ATTEMPTS and has been
+    routed to the DLQ. Returns False when it should be retried.
     """
     raw_value = msg.value()
     key = msg.key()
@@ -107,12 +123,26 @@ def process_message(msg, dlq_producer: Producer) -> bool:
         )
         return True
 
-    except Exception as e:
-        # Anything else — most plausibly a transient DB outage — is NOT
-        # committed. The message will be redelivered and retried the next
-        # time this consumer (re)starts and rejoins the group.
-        logger.error("Transient failure, will retry on restart: %s", e)
+    except OperationalError as e:
+        # The database is unreachable or the connection dropped. The
+        # message itself is fine, so retry it for as long as it takes.
+        logger.error("Database unavailable (attempt %d), will retry: %s", attempt, e)
         db.rollback()
+        return False
+
+    except Exception as e:
+        # Unexpected failure (e.g. a bug in alert generation, or a value the
+        # database rejects). It might be a one-off, so retry a few times;
+        # if it keeps failing, it's a poison message: park it in the DLQ
+        # and move on instead of blocking the partition forever.
+        db.rollback()
+        if attempt >= MAX_ATTEMPTS:
+            logger.error("Failed %d times, routing to DLQ: %s", attempt, e)
+            _send_to_dlq(dlq_producer, key, raw_value,
+                         error=f"failed after {attempt} attempts: {e}")
+            return True
+        logger.error("Processing failed (attempt %d/%d), will retry: %s",
+                     attempt, MAX_ATTEMPTS, e)
         return False
 
     finally:
@@ -155,6 +185,11 @@ def main():
 
     logger.info("Ingestion consumer started. group=%s topic=%s", GROUP_ID, READINGS_TOPIC)
 
+    # Which try this is for the current message. A single counter is enough:
+    # after a failure we seek back, so the next message poll() returns is
+    # always the one being retried.
+    attempt = 1
+
     try:
         while running:
             # Blocks up to 1s waiting for a message; returns None if
@@ -169,9 +204,26 @@ def main():
                 logger.error("Kafka error: %s", msg.error())
                 continue
 
-            should_commit = process_message(msg, dlq_producer)
+            should_commit = process_message(msg, dlq_producer, attempt)
             if should_commit:
                 consumer.commit(msg)
+                attempt = 1
+                continue
+
+            # Retry in place. Not committing is not enough on its own: the
+            # consumer's in-memory position has already moved past this
+            # message, and committing any LATER message on this partition
+            # would mark this one as done too (a committed offset means
+            # "everything before here is handled"). Seeking back makes the
+            # next poll() return this same message, so later readings for
+            # the same tank can't overtake it.
+            consumer.seek(TopicPartition(msg.topic(), msg.partition(), msg.offset()))
+            delay = min(2 ** (attempt - 1), BACKOFF_MAX_SECONDS)
+            attempt += 1
+            # Sleep in small steps so Ctrl+C / SIGTERM still exits promptly.
+            deadline = time.monotonic() + delay
+            while running and time.monotonic() < deadline:
+                time.sleep(0.2)
 
     finally:
         logger.info("Closing consumer, flushing DLQ producer...")
