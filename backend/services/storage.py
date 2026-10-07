@@ -62,7 +62,7 @@ def store_fuel_data_idempotent(db: Session, data):
 
     get_or_create_station(db, data.station_id)
 
-    new_record = models.FuelData(**data.dict())
+    new_record = models.FuelData(**data.model_dump())
     db.add(new_record)
     try:
         # The INSERT is sent here, so Postgres checks the unique constraint

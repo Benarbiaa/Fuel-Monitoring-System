@@ -177,6 +177,58 @@ def process_message(msg, dlq_producer: Producer, attempt: int = 1) -> bool:
         db.close()
 
 
+def _backoff_seconds(attempt: int) -> float:
+    """Wait before retry number `attempt`: 1s, 2s, 4s, ... capped."""
+    return min(2 ** (attempt - 1), BACKOFF_MAX_SECONDS)
+
+
+def consume_loop(consumer, dlq_producer: Producer, is_running) -> None:
+    """
+    Polls, processes and commits messages until is_running() returns False.
+
+    Kept separate from main() (which builds the real Kafka clients and
+    installs signal handlers) so tests can drive it with a fake consumer.
+    """
+    # Which try this is for the current message. A single counter is enough:
+    # after a failure we seek back, so the next message poll() returns is
+    # always the one being retried.
+    attempt = 1
+
+    while is_running():
+        # Blocks up to 1s waiting for a message; returns None if
+        # nothing arrived in that window, so the loop can check
+        # is_running() regularly instead of blocking forever.
+        msg = consumer.poll(timeout=1.0)
+        if msg is None:
+            continue
+        if msg.error():
+            if msg.error().code() == KafkaError._PARTITION_EOF:
+                continue
+            logger.error("Kafka error: %s", msg.error())
+            continue
+
+        should_commit = process_message(msg, dlq_producer, attempt)
+        if should_commit:
+            consumer.commit(msg)
+            attempt = 1
+            continue
+
+        # Retry in place. Not committing is not enough on its own: the
+        # consumer's in-memory position has already moved past this
+        # message, and committing any LATER message on this partition
+        # would mark this one as done too (a committed offset means
+        # "everything before here is handled"). Seeking back makes the
+        # next poll() return this same message, so later readings for
+        # the same tank can't overtake it.
+        consumer.seek(TopicPartition(msg.topic(), msg.partition(), msg.offset()))
+        delay = _backoff_seconds(attempt)
+        attempt += 1
+        # Sleep in small steps so Ctrl+C / SIGTERM still exits promptly.
+        deadline = time.monotonic() + delay
+        while is_running() and time.monotonic() < deadline:
+            time.sleep(0.2)
+
+
 def main():
     consumer = Consumer({
         "bootstrap.servers": BOOTSTRAP_SERVERS,
@@ -217,46 +269,8 @@ def main():
 
     logger.info("Ingestion consumer started. group=%s topic=%s", GROUP_ID, READINGS_TOPIC)
 
-    # Which try this is for the current message. A single counter is enough:
-    # after a failure we seek back, so the next message poll() returns is
-    # always the one being retried.
-    attempt = 1
-
     try:
-        while running:
-            # Blocks up to 1s waiting for a message; returns None if
-            # nothing arrived in that window, so the loop can check
-            # `running` regularly instead of blocking forever.
-            msg = consumer.poll(timeout=1.0)
-            if msg is None:
-                continue
-            if msg.error():
-                if msg.error().code() == KafkaError._PARTITION_EOF:
-                    continue
-                logger.error("Kafka error: %s", msg.error())
-                continue
-
-            should_commit = process_message(msg, dlq_producer, attempt)
-            if should_commit:
-                consumer.commit(msg)
-                attempt = 1
-                continue
-
-            # Retry in place. Not committing is not enough on its own: the
-            # consumer's in-memory position has already moved past this
-            # message, and committing any LATER message on this partition
-            # would mark this one as done too (a committed offset means
-            # "everything before here is handled"). Seeking back makes the
-            # next poll() return this same message, so later readings for
-            # the same tank can't overtake it.
-            consumer.seek(TopicPartition(msg.topic(), msg.partition(), msg.offset()))
-            delay = min(2 ** (attempt - 1), BACKOFF_MAX_SECONDS)
-            attempt += 1
-            # Sleep in small steps so Ctrl+C / SIGTERM still exits promptly.
-            deadline = time.monotonic() + delay
-            while running and time.monotonic() < deadline:
-                time.sleep(0.2)
-
+        consume_loop(consumer, dlq_producer, is_running=lambda: running)
     finally:
         logger.info("Closing consumer, flushing DLQ producer...")
         dlq_producer.flush(10.0)
