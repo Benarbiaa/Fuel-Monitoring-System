@@ -21,6 +21,8 @@ def get_or_create_station(db: Session, station_id: str) -> models.Station:
     enforces this strictly (unlike SQLite, which ignores FKs by default), so
     every station referenced by an incoming FuelData record must exist here
     first or the insert will fail with a ForeignKeyViolation.
+
+    Flushes but does not commit: the caller owns the transaction.
     """
     station = db.query(models.Station).filter(
         models.Station.station_id == station_id
@@ -35,26 +37,13 @@ def get_or_create_station(db: Session, station_id: str) -> models.Station:
         location=meta.get("location", station_id),
     )
     db.add(station)
-    db.commit()
-    db.refresh(station)
+    db.flush()
     return station
-
-
-def store_fuel_data(db: Session, data):
-    # Ensure the parent Station row exists before inserting the FuelData
-    # record that references it (see get_or_create_station for why).
-    get_or_create_station(db, data.station_id)
-
-    new_record = models.FuelData(**data.dict())
-    db.add(new_record)
-    db.commit()
-    db.refresh(new_record)
-    return new_record
 
 
 def store_fuel_data_idempotent(db: Session, data):
     """
-    Like store_fuel_data, but safe to call more than once with the same
+    Stores a reading, safely callable more than once with the same
     (station_id, fuel_type, timestamp) — which happens under Kafka's
     at-least-once delivery whenever a message is reprocessed (e.g. after a
     consumer crash/restart before its offset was committed).
@@ -63,6 +52,11 @@ def store_fuel_data_idempotent(db: Session, data):
     exact key already existed (meaning: this message was already processed
     previously; the caller should skip alert generation for it and just
     move on to committing the Kafka offset).
+
+    Flushes but does not commit: the caller commits the reading together
+    with its alerts in one transaction. That is what makes "the reading
+    already exists" a reliable signal that its alerts exist too — if
+    anything fails before the commit, both are rolled back together.
     """
     from sqlalchemy.exc import IntegrityError
 
@@ -71,7 +65,9 @@ def store_fuel_data_idempotent(db: Session, data):
     new_record = models.FuelData(**data.dict())
     db.add(new_record)
     try:
-        db.commit()
+        # The INSERT is sent here, so Postgres checks the unique constraint
+        # now rather than at commit time.
+        db.flush()
     except IntegrityError:
         # The unique constraint on (station_id, fuel_type, timestamp)
         # rejected this insert — we've already stored this exact reading.
@@ -80,7 +76,6 @@ def store_fuel_data_idempotent(db: Session, data):
         db.rollback()
         return None
 
-    db.refresh(new_record)
     return new_record
 
 def create_alert(db: Session, station_id: str, fuel_type: str, alert_type: str, severity: str, message: str):
@@ -93,7 +88,7 @@ def create_alert(db: Session, station_id: str, fuel_type: str, alert_type: str, 
         status="new",
     )
     db.add(new_alert)
-    db.commit()
+    db.flush()  # caller commits (see store_fuel_data_idempotent)
     return new_alert
 
 # --- READ METHODS ---

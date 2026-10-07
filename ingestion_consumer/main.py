@@ -81,9 +81,11 @@ def process_message(msg, dlq_producer: Producer) -> bool:
         _send_to_dlq(dlq_producer, key, raw_value, error=str(e))
         return True  # permanently handled — commit past it
 
-    # 2. Write to the database (idempotently — see storage.py) and
-    # generate alerts in the same session, mirroring exactly what the
-    # /ingest HTTP handler does today for a request.
+    # 2. Write the reading (idempotently — see storage.py) and generate its
+    # alerts in ONE transaction: the helpers only flush, and the single
+    # commit below makes everything permanent at once. If anything fails
+    # before it, the rollback undoes the reading too, so a retry can never
+    # mistake a half-processed message for an already-processed one.
     db = SessionLocal()
     try:
         record = storage.store_fuel_data_idempotent(db, validated)
@@ -98,6 +100,7 @@ def process_message(msg, dlq_producer: Producer) -> bool:
             return True
 
         generate_alerts_from_record(db, record)
+        db.commit()
         logger.info(
             "Stored reading: %s/%s stock=%.1fL",
             record.station_id, record.fuel_type, record.stock_liters,
