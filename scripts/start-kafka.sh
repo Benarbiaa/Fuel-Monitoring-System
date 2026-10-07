@@ -46,14 +46,26 @@ docker run -d \
   -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
   "$IMAGE"
 
+BIN=/opt/kafka/bin/kafka-topics.sh
+
+# Wait until the broker actually answers, instead of sleeping a fixed time
+# and hoping: startup takes longer on a cold start or a slow machine, and
+# creating topics before the broker is ready fails.
 echo "Waiting for broker to come up..."
-sleep 5
-docker logs "$CONTAINER_NAME" --tail 10
+for _ in $(seq 1 60); do
+  if docker exec "$CONTAINER_NAME" "$BIN" --list --bootstrap-server localhost:9092 >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+if ! docker exec "$CONTAINER_NAME" "$BIN" --list --bootstrap-server localhost:9092 >/dev/null 2>&1; then
+  echo "Broker did not become ready within 60s. Last logs:" >&2
+  docker logs "$CONTAINER_NAME" --tail 20 >&2
+  exit 1
+fi
 
 echo ""
 echo "Kafka is up. Creating topics (safe to ignore 'already exists' errors)..."
-
-BIN=/opt/kafka/bin/kafka-topics.sh
 
 docker exec "$CONTAINER_NAME" "$BIN" \
   --create --if-not-exists \
