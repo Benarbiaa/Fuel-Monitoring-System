@@ -41,6 +41,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 from typing import Any, Optional
 
 from confluent_kafka import Producer
@@ -49,6 +51,10 @@ logger = logging.getLogger("kafka_producer")
 
 DEFAULT_BOOTSTRAP_SERVERS = "localhost:9092"
 READINGS_TOPIC = "fuel.readings.raw"
+
+
+class DeliveryError(Exception):
+    """Kafka rejected a message, or didn't confirm it within the timeout."""
 
 
 def _delivery_report(err, msg):
@@ -134,6 +140,56 @@ class ReadingsProducer:
 
         # Non-blocking poll to service any pending delivery-report callbacks.
         self._producer.poll(0)
+
+    def send_and_wait(
+        self,
+        station_id: str,
+        fuel_type: str,
+        payload: dict[str, Any],
+        timeout: float = 5.0,
+    ) -> None:
+        """
+        Publishes one reading and blocks until the broker confirms it.
+        Raises DeliveryError if Kafka rejects it or doesn't confirm within
+        `timeout` seconds, and lets BufferError through if the local queue
+        is full. For callers that must not report success before the
+        reading is actually in Kafka, such as POST /ingest.
+
+        Waits only for THIS message, not with flush(): the producer is
+        shared by every request, and flush() would make each request wait
+        for everyone else's messages too. Instead the message gets its own
+        callback that sets an Event, and we poll until it fires. poll() is
+        thread-safe, and whichever thread's poll() runs the callback, it
+        only sets this message's own Event.
+
+        On timeout the message may still be delivered later. A client that
+        retries then publishes it twice, which is harmless: the consumer
+        stores each (station_id, fuel_type, timestamp) only once.
+        """
+        delivered = threading.Event()
+        result = {}
+
+        def _on_delivery(err, msg):
+            result["error"] = err
+            _delivery_report(err, msg)  # keep the usual logging
+            delivered.set()
+
+        self._producer.produce(
+            topic=READINGS_TOPIC,
+            key=f"{station_id}:{fuel_type}".encode("utf-8"),
+            value=json.dumps(payload).encode("utf-8"),
+            callback=_on_delivery,
+        )
+
+        deadline = time.monotonic() + timeout
+        while not delivered.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DeliveryError(f"not confirmed by Kafka within {timeout:.0f}s")
+            self._producer.poll(min(remaining, 0.1))
+
+        if result["error"] is not None:
+            raise DeliveryError(str(result["error"]))
 
     def close(self, timeout: Optional[float] = 10.0) -> None:
         """Flushes any in-flight messages before shutdown. Call this once,
