@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from typing import Any, Optional
@@ -49,6 +50,8 @@ from confluent_kafka import Producer
 
 logger = logging.getLogger("kafka_producer")
 
+# Overridable with the KAFKA_BOOTSTRAP_SERVERS environment variable, e.g.
+# "kafka:9092" when running inside Docker Compose.
 DEFAULT_BOOTSTRAP_SERVERS = "localhost:9092"
 READINGS_TOPIC = "fuel.readings.raw"
 
@@ -90,7 +93,10 @@ class ReadingsProducer:
         producer.close()  # flush on shutdown
     """
 
-    def __init__(self, bootstrap_servers: str = DEFAULT_BOOTSTRAP_SERVERS):
+    def __init__(self, bootstrap_servers: Optional[str] = None):
+        bootstrap_servers = bootstrap_servers or os.getenv(
+            "KAFKA_BOOTSTRAP_SERVERS", DEFAULT_BOOTSTRAP_SERVERS
+        )
         self._producer = Producer(
             {
                 "bootstrap.servers": bootstrap_servers,

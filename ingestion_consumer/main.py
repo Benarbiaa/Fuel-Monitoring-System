@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import signal
 import time
 
@@ -28,7 +29,8 @@ from backend.services.alerts import generate_alerts_from_record
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ingestion_consumer")
 
-BOOTSTRAP_SERVERS = "localhost:9092"
+# Read after the backend imports above, which load .env.
+BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 READINGS_TOPIC = "fuel.readings.raw"
 DLQ_TOPIC = "fuel.readings.dlq"
 

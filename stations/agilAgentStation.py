@@ -210,7 +210,8 @@ def _parse_args():
         default="kafka",
         help=(
             "Where readings are sent. 'kafka' publishes to fuel.readings.raw "
-            "(requires a running broker at localhost:9092). 'http' POSTs "
+            "(requires a running broker; set KAFKA_BOOTSTRAP_SERVERS if it "
+            "isn't at localhost:9092). 'http' POSTs "
             "directly to /ingest, matching the original pre-Kafka behavior — "
             "kept as a fallback if Kafka isn't available."
         ),
