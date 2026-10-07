@@ -33,7 +33,7 @@ The backend and chat services are fully independent processes that only talk to 
 - **Kafka-backed ingestion** — replayable event log, idempotent producer and consumer, retries with backoff, dead-letter handling for malformed or repeatedly failing messages
 - **Real-time telemetry** — stations push fuel readings every 10 minutes, auto-registering new stations on first contact
 - **Automated alerts** — LOW_STOCK, PRICE_ANOMALY, HIGH_CONSUMPTION, STATION_CRITICAL, RESTOCK (delivery detection, inferred from stock-level increases)
-- **Autonomous response agent** — background watcher polls for new critical alerts and uses an LLM to decide/execute an action (reorder, notify manager, or escalate), logging every decision to an audit trail
+- **Autonomous response agent** — background watcher polls for critical alerts and uses an LLM to decide/execute an action (reorder, notify manager, or escalate), with retries and backoff, a human-escalation fallback, and an audit trail of every action taken
 - **Stock forecasting** — Prophet-based time-series predictions with LLM narrative
 - **AI chat assistant** — Groq-powered agent with tool-calling over live stock/alerts/forecast data, plus semantic search over historical reports
 - **LLM-generated reports** — persisted station reports (Markdown + PDF export), searchable by the chat assistant for pattern/history questions
@@ -160,6 +160,12 @@ Creates the tables (run once; also happens automatically on backend startup, but
 python init_db.py
 ```
 
+**Upgrading an existing database?** `create_all()` never adds columns to existing tables, so apply the scripts in `scripts/migrations/` once, in order:
+
+```bash
+psql "$DATABASE_URL" -f scripts/migrations/001_alert_retry_columns.sql
+```
+
 ---
 
 ## Running
@@ -218,7 +224,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-The suite covers the ingestion pipeline: alert rules, the consumer (transactions, retries, ordering, DLQ routing), the producer and `POST /ingest`. It runs against an in-memory SQLite database with small Kafka fakes, so it needs no services running. One integration test also runs against a real broker when one is available (`./scripts/start-kafka.sh`), and is skipped otherwise.
+The suite covers the ingestion pipeline — alert rules, the consumer (transactions, retries, ordering, DLQ routing), the producer and `POST /ingest` — and the automation agent (retries, fallback escalation, leases, audit-trail consistency), with the LLM faked so no API calls are made. It runs against an in-memory SQLite database with small Kafka fakes, so it needs no services running. One integration test also runs against a real broker when one is available (`./scripts/start-kafka.sh`), and is skipped otherwise.
 
 ---
 
@@ -237,9 +243,20 @@ The suite covers the ingestion pipeline: alert rules, the consumer (transactions
 
 ## Automation Agent
 
-Every alert has a `status` field (`new` → `processing` → `acknowledged`). A background watcher in the backend process polls for `critical` alerts with `status="new"`, hands each one to an LLM (`responder.py`) to decide an action — `reorder`, `notify_manager`, or `escalate` — and executes it via `actions.py` (email/log). Every decision is recorded in the `incident_logs` table for audit purposes.
+A background watcher in the backend process polls every 30 seconds for `critical` alerts, hands each one to an LLM (`responder.py`) to decide an action — `reorder`, `notify_manager`, or `escalate` — and executes it via `actions.py` (email/log). Every action taken is recorded in the `incident_logs` table, committed together with the alert's new status so the audit trail can't disagree with it.
 
-**Known limitation:** if the LLM call fails (bad API key, rate limit, network issue), the alert stays stuck in `processing` and is never retried, since the watcher only polls `status="new"` alerts. Worth adding retry-with-backoff logic if this matters for your use case.
+Every outcome ends in a defined state — a critical alert is never closed without an action:
+
+| What happens | Alert ends up |
+|---|---|
+| LLM decides, action succeeds | `acknowledged`, `handled_by="agent"` |
+| LLM times out / is rate-limited / errors, or the action fails (e.g. mail server down) | `retrying`, with the error in `last_error`; retried after 30s, 1m, 2m, 4m |
+| Still failing after 5 attempts | escalated to a human: `acknowledged`, `handled_by="fallback"` |
+| LLM unusable (no API key, key rejected) | escalated immediately, `handled_by="fallback"` |
+| LLM picks an action that doesn't exist | escalated instead (LLM output is never trusted as-is) |
+| Backend dies mid-processing | picked up again when its 5-minute lease expires |
+
+See [`docs/debugging/alert-agent-review.md`](docs/debugging/alert-agent-review.md) for how each of these was broken before, and how it's tested.
 
 ---
 
@@ -327,9 +344,8 @@ The chat agent (`chat/services/gemini_service.py`) has access to these tools, di
 
 ## Known Limitations / Things to Revisit
 
-- **Schema changes require a full table drop/recreate** — the project uses `Base.metadata.create_all()`, which only creates missing tables and never alters existing ones. Two schema changes during the Kafka migration (a unique constraint, and switching timestamp columns to `timezone=True`) both required manually dropping and recreating tables. This is fine for a solo dev project with disposable data, but is exactly the gap Alembic migrations exist to close — worth adding before this schema changes again.
+- **Schema changes require a full table drop/recreate** — the project uses `Base.metadata.create_all()`, which only creates missing tables and never alters existing ones. Two schema changes during the Kafka migration (a unique constraint, and switching timestamp columns to `timezone=True`) both required manually dropping and recreating tables, and the alert-agent retry columns needed a hand-written script (`scripts/migrations/`). This is fine for a solo dev project with disposable data, but is exactly the gap Alembic migrations exist to close — worth adding before this schema changes again.
 - **`/report` makes a live, uncached Groq API call every time it's hit** — repeated requests (e.g. tab switches) each trigger a fresh LLM call. Worth caching by station_id with a short TTL if cost/latency becomes a concern.
-- **Stuck alerts on repeated LLM failures** — see "Automation Agent" above.
 - **Kafka runs as a single broker with `replication.factor=1` everywhere**, including its internal topics — correct and necessary for a one-node local dev setup, but not representative of how a production cluster would be configured (see the ADR's "Known gotcha" section for why this specific setting matters).
 - Frontend has known `npm audit` findings inherited from the Angular 16 dependency tree (54 vulnerabilities at last check, mostly transitive). Not urgent, but worth revisiting during a future Angular upgrade.
 
