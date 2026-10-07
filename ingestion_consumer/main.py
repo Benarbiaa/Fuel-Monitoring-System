@@ -23,7 +23,7 @@ from sqlalchemy.exc import OperationalError
 from backend.database.database import SessionLocal
 from backend.schemas import FuelData as FuelDataSchema
 from backend.services import storage
-from backend.routes.data import generate_alerts_from_record
+from backend.services.alerts import generate_alerts_from_record
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ingestion_consumer")
