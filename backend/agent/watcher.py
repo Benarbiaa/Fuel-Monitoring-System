@@ -1,6 +1,22 @@
+"""
+Background loop that hands critical alerts to the responder.
+
+An alert is "due" when it is critical and either:
+- new,
+- retrying and its retry time has come, or
+- processing but its lease has expired.
+
+Claiming an alert sets it to "processing" with a lease (next_attempt_at =
+now + LEASE_SECONDS) and counts an attempt. If the backend dies mid-way,
+nothing resets the status, but the lease runs out and the next poll picks
+the alert up again, so no alert can stay stuck in "processing" forever.
+"""
+
 import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from backend.database.database import SessionLocal
@@ -11,39 +27,58 @@ from backend.agent.responder import process_alert
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+POLL_INTERVAL_SECONDS = 30
+# Longer than one attempt can take (LLM timeout 30s + email timeout 10s),
+# so a live attempt is never mistaken for a dead one.
+LEASE_SECONDS = 300
+
+
+def claim_due_alerts(db: Session, now: datetime) -> list[int]:
+    """Marks every due alert as processing (with a lease) and returns their IDs."""
+    due = db.query(models.Alert).filter(
+        models.Alert.severity == "critical",
+        models.Alert.status.in_(["new", "retrying", "processing"]),
+        or_(models.Alert.next_attempt_at.is_(None), models.Alert.next_attempt_at <= now),
+    ).all()
+
+    for alert in due:
+        if alert.status == "processing":
+            logger.warning(f"[WATCHER] Alert {alert.id} lease expired mid-processing; picking it up again")
+        alert.status = "processing"
+        alert.attempts += 1
+        alert.next_attempt_at = now + timedelta(seconds=LEASE_SECONDS)
+    db.commit()
+    return [alert.id for alert in due]
+
+
+async def run_once(now: datetime | None = None) -> int:
+    """One poll: claim due alerts and process them. Returns how many."""
+    db: Session = SessionLocal()
+    try:
+        alert_ids = claim_due_alerts(db, now or datetime.now(timezone.utc))
+    finally:
+        db.close()
+
+    if alert_ids:
+        print(f"[WATCHER] Claimed {len(alert_ids)} due critical alert(s): {alert_ids}")
+    for alert_id in alert_ids:
+        # process_alert records every outcome itself (handled, retrying, or
+        # left for the lease to expire), so one alert can't stop the others.
+        await process_alert(alert_id)
+    return len(alert_ids)
+
 
 async def watch_critical_alerts():
     print("🔍 Alert Watcher started")  # use print as backup
     logger.info("🔍 Alert Watcher started")
 
     while True:
-        db: Session = SessionLocal()
         try:
-            critical_alerts = db.query(models.Alert).filter(
-                models.Alert.status == "new",
-                models.Alert.severity == "critical"
-            ).all()
-
-            print(f"[WATCHER] Polled — found {len(critical_alerts)} critical new alert(s)")
-
-            for alert in critical_alerts:
-                try:
-                    # Mark as "processing" to prevent double-processing race condition
-                    alert.status = "processing"
-                    db.commit()
-                    
-                    print(f"[WATCHER] Handing off alert {alert.id} ({alert.alert_type}) to responder...")
-                    # Pass alert ID only, let responder open fresh DB session
-                    await process_alert(alert.id)
-                except Exception as e:
-                    print(f"[WATCHER] Error processing alert {alert.id}: {e}")
-
+            await run_once()
         except Exception as e:
+            # e.g. the database is unreachable: try again next poll.
             print(f"[WATCHER] Error: {e}")
-        finally:
-            db.close()
-
-        await asyncio.sleep(30)
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 
 async def start_watcher_async():

@@ -64,10 +64,18 @@ class Alert(Base):
     severity = Column(String)
     message = Column(String)
 
-    # Automation-agent workflow fields
-    status = Column(String, default="new")  # new | processing | acknowledged
-    handled_by = Column(String, nullable=True)  # "agent" | "system" | None
+    # Automation-agent workflow fields (see backend/agent/watcher.py)
+    status = Column(String, default="new")  # new | processing | retrying | acknowledged
+    handled_by = Column(String, nullable=True)  # "agent" | "fallback" | None
     handled_at = Column(DateTime(timezone=True), nullable=True)
+    # How many times the agent has picked this alert up (incremented on
+    # each claim, so a crash mid-processing also counts as an attempt).
+    attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    # When the agent may pick it up next: the retry time while "retrying",
+    # the lease expiry while "processing" (if the agent dies mid-way, the
+    # lease runs out and the alert is picked up again), None when "new".
+    next_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(String, nullable=True)
 
 
 # 4. IncidentLog Table: Audit trail of actions taken by the automation agent

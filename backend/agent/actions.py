@@ -15,43 +15,47 @@ from email.message import EmailMessage
 
 logger = logging.getLogger(__name__)
 
+ALLOWED_ACTIONS = {"reorder", "notify_manager", "escalate"}
 
-async def execute_action(action: str, alert: models.Alert, db: Session, reason: str = ""):
+
+async def execute_action(action: str, alert: models.Alert, db: Session, reason: str = "",
+                         actor: str = "agent"):
     """
-    Execute the specified action on an alert.
-    The db session is passed for future integration with persistence (e.g., ActionLog table).
-    Currently, all actions just log to stdout/logger.
+    Execute the specified action on an alert and add an incident log entry.
+
+    Raises if the action fails (e.g. the manager email can't be sent), so
+    the caller can retry instead of recording an action that didn't happen.
+    The incident log is only flushed, not committed: the caller commits it
+    together with the alert's new status (see responder.process_alert).
     """
+    if action not in ALLOWED_ACTIONS:
+        raise ValueError(f"Unknown action: {action!r}")
+
     logger.info(f"Executing action '{action}' for alert {alert.id}: {reason}")
-    
+
     if action == "reorder":
         await reorder(alert, db, reason)
     elif action == "notify_manager":
         await notify_manager(alert, db, reason)
     elif action == "escalate":
         await escalate(alert, db, reason)
-    else:
-        logger.warning(f"Unknown action: {action}")
 
-    # persist an incident log for auditability
-    try:
-        incident = models.IncidentLog(
-            alert_id=alert.id,
-            action=action,
-            reason=reason,
-            payload=json.dumps({
-                "station_id": alert.station_id,
-                "fuel_type": alert.fuel_type,
-                "message": alert.message,
-                "severity": alert.severity,
-            }),
-            actor="agent"
-        )
-        db.add(incident)
-        db.commit()
-        logger.info(f"Incident logged id={incident.id} for alert {alert.id}")
-    except Exception as e:
-        logger.exception(f"Failed to write incident log: {e}")
+    # Incident log for auditability, written only once the action succeeded.
+    incident = models.IncidentLog(
+        alert_id=alert.id,
+        action=action,
+        reason=reason,
+        payload=json.dumps({
+            "station_id": alert.station_id,
+            "fuel_type": alert.fuel_type,
+            "message": alert.message,
+            "severity": alert.severity,
+        }),
+        actor=actor,
+    )
+    db.add(incident)
+    db.flush()
+    logger.info(f"Incident logged id={incident.id} for alert {alert.id}")
 
 
 async def reorder(alert: models.Alert, db: Session, reason: str):
@@ -89,11 +93,10 @@ async def notify_manager(alert: models.Alert, db: Session, reason: str):
         subject = f"[Alert] {alert.station_id} {alert.fuel_type} - {alert.alert_type}"
         body = f"Station: {alert.station_id}\nFuel: {alert.fuel_type}\nSeverity: {alert.severity}\n\nMessage:\n{alert.message}\n\nReason:\n{reason}\n\nTimestamp: {alert.timestamp}\n"
 
-        try:
-            await _send_email_async(email_from, email_to, subject, body, smtp_host, smtp_port, smtp_user, smtp_pass, smtp_use_tls)
-            logger.info(f"Email notification sent to {email_to}")
-        except Exception as e:
-            logger.exception(f"Failed to send notification email: {e}")
+        # Not caught here: if the manager can't be notified, the action
+        # failed, and the responder retries it rather than logging it as done.
+        await _send_email_async(email_from, email_to, subject, body, smtp_host, smtp_port, smtp_user, smtp_pass, smtp_use_tls)
+        logger.info(f"Email notification sent to {email_to}")
     else:
         logger.info("SMTP not fully configured; skipping email send")
 
