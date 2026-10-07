@@ -49,24 +49,51 @@ MAX_ATTEMPTS = 5
 # called within that window, Kafka assumes this consumer is dead and
 # removes it from the group.
 BACKOFF_MAX_SECONDS = 30
+# How long a DLQ write may take before it counts as failed. Also set as the
+# DLQ producer's message.timeout.ms, so a write that times out is dropped
+# from the producer's queue instead of being delivered later anyway (which
+# would duplicate it in the DLQ once the message is retried).
+DLQ_DELIVERY_TIMEOUT_SECONDS = 10
 
 
-def _send_to_dlq(dlq_producer: Producer, key, raw_value: bytes, error: str) -> None:
+def _send_to_dlq(dlq_producer: Producer, key, raw_value: bytes, error: str) -> bool:
     """
     Publishes an unprocessable message to the dead-letter topic, wrapped
     with the error that made it unprocessable, so it's inspectable later
     instead of just vanishing into a log line no one will read.
+
+    Waits for the broker to confirm the write and returns True only if it
+    did. The caller commits past the original message only on True: produce()
+    just queues locally, so committing right after it could lose the message
+    from both topics if the DLQ write then failed.
     """
     dlq_payload = {
         "error": error,
         "original_value": raw_value.decode("utf-8", errors="replace"),
     }
+    result = {}
+
+    def _on_delivery(err, _msg):
+        result["error"] = err
+
     dlq_producer.produce(
         topic=DLQ_TOPIC,
         key=key,
         value=json.dumps(dlq_payload).encode("utf-8"),
+        callback=_on_delivery,
     )
-    dlq_producer.poll(0)
+    # Blocks until the delivery callback has fired (success or failure).
+    # DLQ_DELIVERY_TIMEOUT_SECONDS bounds it via message.timeout.ms on the
+    # producer; the extra margin here is just so flush() outlives it.
+    dlq_producer.flush(DLQ_DELIVERY_TIMEOUT_SECONDS + 5)
+
+    if "error" not in result:
+        logger.error("DLQ write not confirmed in time")
+        return False
+    if result["error"] is not None:
+        logger.error("DLQ write failed: %s", result["error"])
+        return False
+    return True
 
 
 def process_message(msg, dlq_producer: Producer, attempt: int = 1) -> bool:
@@ -94,8 +121,8 @@ def process_message(msg, dlq_producer: Producer, attempt: int = 1) -> bool:
         validated = FuelDataSchema(**payload_dict)
     except (json.JSONDecodeError, ValidationError) as e:
         logger.warning("Invalid message, routing to DLQ: %s", e)
-        _send_to_dlq(dlq_producer, key, raw_value, error=str(e))
-        return True  # permanently handled — commit past it
+        # Commit past it only once the DLQ has it; otherwise retry later.
+        return _send_to_dlq(dlq_producer, key, raw_value, error=str(e))
 
     # 2. Write the reading (idempotently — see storage.py) and generate its
     # alerts in ONE transaction: the helpers only flush, and the single
@@ -138,9 +165,8 @@ def process_message(msg, dlq_producer: Producer, attempt: int = 1) -> bool:
         db.rollback()
         if attempt >= MAX_ATTEMPTS:
             logger.error("Failed %d times, routing to DLQ: %s", attempt, e)
-            _send_to_dlq(dlq_producer, key, raw_value,
-                         error=f"failed after {attempt} attempts: {e}")
-            return True
+            return _send_to_dlq(dlq_producer, key, raw_value,
+                                error=f"failed after {attempt} attempts: {e}")
         logger.error("Processing failed (attempt %d/%d), will retry: %s",
                      attempt, MAX_ATTEMPTS, e)
         return False
@@ -168,7 +194,11 @@ def main():
     })
     consumer.subscribe([READINGS_TOPIC])
 
-    dlq_producer = Producer({"bootstrap.servers": BOOTSTRAP_SERVERS})
+    dlq_producer = Producer({
+        "bootstrap.servers": BOOTSTRAP_SERVERS,
+        "acks": "all",
+        "message.timeout.ms": DLQ_DELIVERY_TIMEOUT_SECONDS * 1000,
+    })
 
     running = True
 

@@ -22,6 +22,16 @@ Design notes (see docs/adr/0001-kafka-ingestion.md for the full rationale):
   (so there's only one replica to acknowledge anyway). This keeps the
   producer config identical to what a real multi-broker cluster would use,
   so nothing needs to change when this moves off a single-node dev setup.
+- The producer is idempotent (enable.idempotence). Without it, retries can
+  break the per-tank ordering the message key exists for: the producer
+  sends several batches without waiting for each acknowledgement, so if
+  batch 1 fails transiently and batch 2 succeeds, the retried batch 1 lands
+  AFTER batch 2. A retry can also write a message twice when the write
+  succeeded but its acknowledgement was lost. With idempotence the broker
+  gives this producer an ID and tracks a sequence number per partition: it
+  drops duplicates and refuses out-of-order writes, so retries are safe.
+  (The Java client enables this by default since Kafka 3.0; librdkafka,
+  which confluent-kafka uses, does not.)
 - Delivery is asynchronous (produce() returns immediately); a callback
   logs success/failure. flush() is called on shutdown to make sure nothing
   is lost when the process exits.
@@ -79,6 +89,9 @@ class ReadingsProducer:
             {
                 "bootstrap.servers": bootstrap_servers,
                 "acks": "all",
+                # Safe retries: no duplicates, no reordering within a
+                # partition (see module docstring).
+                "enable.idempotence": True,
                 # Retry transient errors (e.g. broker briefly unreachable)
                 # rather than failing the first blip. linger.ms batches
                 # near-simultaneous sends slightly for efficiency without
