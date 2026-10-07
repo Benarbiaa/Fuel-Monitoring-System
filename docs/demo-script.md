@@ -113,6 +113,23 @@ them in a `TIMESTAMP WITHOUT TIME ZONE` column. Fixed by using
 of code correctly without questioning an environment assumption underneath
 all of it."
 
+**8. If asked "what happens when something fails?" — show it.**
+Stop Kafka (`docker stop kafka`) and send the same `curl` as in step 3:
+it now answers `503` after about 5 seconds instead of `202`. "The API
+only says 'accepted' once Kafka has confirmed it has the reading;
+otherwise the client is told to retry." Restart Kafka (`docker start
+kafka`) and the same request returns `202` again.
+
+Then the consumer side, without live surgery: run `pytest
+tests/test_consumer.py -v` and point at the test names
+(`test_failed_message_is_retried_not_skipped`,
+`test_crash_between_alerts_rolls_back_the_reading`,
+`test_poison_message_is_parked_and_the_rest_flows`). "Each of these was a
+real bug — the code's comments promised retries, but a failed message was
+actually skipped for good. I reproduced each one before fixing it, and
+checked that every test fails if the fix is removed." The full story is in
+`docs/debugging/kafka-reliability-review.md`.
+
 ## If something doesn't come up cleanly
 
 - **Kafka container not running** (`docker ps` shows nothing): `./scripts/start-kafka.sh`.

@@ -2,7 +2,7 @@
 
 A full-stack fuel monitoring and forecasting platform for AGIL fuel stations. Collects real-time telemetry, generates automated alerts, forecasts stock levels, runs an autonomous response agent, and provides an AI-powered chat assistant with semantic search over past reports.
 
-> **Reviewing this project?** [`docs/demo-script.md`](docs/demo-script.md) walks through the Kafka ingestion pipeline live in ~5 minutes, and [`docs/debugging/timestamp-timezone-bug.md`](docs/debugging/timestamp-timezone-bug.md) is a full writeup of a real bug found and fixed during development — how it was investigated, where the investigation initially went wrong, and why.
+> **Reviewing this project?** [`docs/demo-script.md`](docs/demo-script.md) walks through the Kafka ingestion pipeline live in ~5 minutes, [`docs/debugging/timestamp-timezone-bug.md`](docs/debugging/timestamp-timezone-bug.md) is a full writeup of a real bug found and fixed during development — how it was investigated, where the investigation initially went wrong, and why — and [`docs/debugging/kafka-reliability-review.md`](docs/debugging/kafka-reliability-review.md) covers what happened to readings when parts of the pipeline failed, how each problem was reproduced, and how it's now tested.
 
 ---
 
@@ -20,7 +20,7 @@ Fuel-Monitorin-System/
 └── stations/              Station simulation agent (Kafka producer)
 ```
 
-**Ingestion pipeline:** station telemetry (from the simulator, or from `POST /ingest`) is published to a Kafka topic (`fuel.readings.raw`), keyed by `station_id:fuel_type` to preserve per-tank ordering. A dedicated consumer service validates each message, writes it to Postgres idempotently (unique constraint on `station_id` + `fuel_type` + `timestamp`, safe under Kafka's at-least-once delivery), and generates alerts. `/ingest` itself no longer writes to the database — it's a thin producer that returns `202 Accepted` once the reading is queued. Malformed messages are routed to a dead-letter topic (`fuel.readings.dlq`) instead of blocking the pipeline. See [`docs/adr/0001-kafka-ingestion.md`](docs/adr/0001-kafka-ingestion.md) for the full rationale, alternatives considered, and known local-dev gotchas.
+**Ingestion pipeline:** station telemetry (from the simulator, or from `POST /ingest`) is published to a Kafka topic (`fuel.readings.raw`), keyed by `station_id:fuel_type` to preserve per-tank ordering. A dedicated consumer service validates each message, writes it to Postgres idempotently (unique constraint on `station_id` + `fuel_type` + `timestamp`, safe under Kafka's at-least-once delivery), and generates alerts. `/ingest` itself no longer writes to the database — it's a thin producer that returns `202 Accepted` once Kafka has confirmed it stored the reading (`503` if it can't, so the client knows to retry). A reading and its alerts are stored in one database transaction, and the Kafka offset is committed only after that. A message that fails is retried in place with backoff, preserving per-tank order; database outages are retried until the database is back, while messages that are malformed or keep failing are routed to a dead-letter topic (`fuel.readings.dlq`) instead of blocking the pipeline. See [`docs/adr/0001-kafka-ingestion.md`](docs/adr/0001-kafka-ingestion.md) for the full rationale, alternatives considered, and known local-dev gotchas.
 
 This was a deliberate migration from an earlier version where `/ingest` wrote synchronously to the database in the same request — see the ADR for why that was limiting (no replay, no backpressure isolation, ingestion coupled to DB write throughput).
 
@@ -30,7 +30,7 @@ The backend and chat services are fully independent processes that only talk to 
 
 ## Features
 
-- **Kafka-backed ingestion** — replayable event log, idempotent writes, dead-letter handling for malformed data
+- **Kafka-backed ingestion** — replayable event log, idempotent producer and consumer, retries with backoff, dead-letter handling for malformed or repeatedly failing messages
 - **Real-time telemetry** — stations push fuel readings every 10 minutes, auto-registering new stations on first contact
 - **Automated alerts** — LOW_STOCK, PRICE_ANOMALY, HIGH_CONSUMPTION, STATION_CRITICAL, RESTOCK (delivery detection, inferred from stock-level increases)
 - **Autonomous response agent** — background watcher polls for new critical alerts and uses an LLM to decide/execute an action (reorder, notify manager, or escalate), logging every decision to an audit trail
@@ -136,6 +136,7 @@ GROQ_API_KEY=your_groq_api_key_here
 SMTP_USER=your_email@gmail.com
 SMTP_PASS=your_app_password
 MANAGER_EMAIL=manager@example.com
+KAFKA_BOOTSTRAP_SERVERS=localhost:9092   # optional, this is the default
 ```
 
 Get a free Groq API key at [console.groq.com](https://console.groq.com).
@@ -210,6 +211,17 @@ python agilAgentStation.py --sink kafka
 
 ---
 
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The suite covers the ingestion pipeline: alert rules, the consumer (transactions, retries, ordering, DLQ routing), the producer and `POST /ingest`. It runs against an in-memory SQLite database with small Kafka fakes, so it needs no services running. One integration test also runs against a real broker when one is available (`./scripts/start-kafka.sh`), and is skipped otherwise.
+
+---
+
 ## Alert Thresholds
 
 | Alert | Condition | Severity |
@@ -247,6 +259,7 @@ backend/
 │   └── report_routes.py       GET /report /report/pdf /reports (list history)
 ├── services/
 │   ├── storage.py             DB read/write helpers, auto-registers new stations on ingest
+│   ├── alerts.py              Alert rules applied to each incoming reading (used by the consumer)
 │   ├── prophet_service.py     Stock forecasting
 │   └── report_services.py     LLM report generation
 └── agent/
@@ -280,6 +293,14 @@ frontend/src/app/
 
 stations/
 └── agilAgentStation.py          Simulates a station sending live telemetry
+
+ingestion_consumer/
+└── main.py                      Kafka consumer: validate, store + alert in one transaction, retry, DLQ
+
+kafka_common/
+└── readings_producer.py         Shared idempotent producer (simulator + /ingest)
+
+tests/                           pytest suite for the ingestion pipeline
 ```
 
 ---

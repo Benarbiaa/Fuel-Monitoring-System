@@ -1,6 +1,6 @@
 # 1. Move fuel-reading ingestion from synchronous HTTP to Kafka
 
-Status: Accepted (Phase 0 infrastructure in place; producer/consumer migration in progress)
+Status: Accepted, implemented (migration complete; reliability hardened 2026-10-07)
 Date: 2026-09-17
 
 ## Context
@@ -105,3 +105,32 @@ These are baked into `scripts/start-kafka.sh`. This setting is
 **dev-only** — a real multi-broker cluster should use the default of 3
 (or at least 2) for durability of consumer offsets and transactional
 state.
+
+## Update (2026-10-07): delivery guarantees as implemented
+
+A review of failure handling after the migration found that several of the
+guarantees above held only on the happy path: a failed message could be
+skipped rather than retried, a crash could keep a reading but lose its
+alerts, and `/ingest` could answer 202 for a reading Kafka never received.
+The full investigation, with reproductions, is in
+[`docs/debugging/kafka-reliability-review.md`](../debugging/kafka-reliability-review.md).
+The resulting design:
+
+- **Producers** are idempotent (`enable.idempotence`), so retries can't
+  reorder or duplicate readings within a partition. `/ingest` waits for
+  the broker's confirmation before answering 202, and answers 503 if it
+  doesn't get one.
+- **The consumer** stores a reading and its alerts in one database
+  transaction, and commits the Kafka offset only after that transaction
+  commits (or after the message is confirmed in the DLQ).
+- **Failed messages are retried in place**: the consumer seeks back to the
+  failed offset and waits with exponential backoff, preserving per-tank
+  ordering. Database outages are retried indefinitely; any other error is
+  retried 5 times, then the message goes to `fuel.readings.dlq` with the
+  error, so one poison message can't block its partition.
+- **The broker address** is configurable with `KAFKA_BOOTSTRAP_SERVERS`
+  (default `localhost:9092`).
+
+Delivery is therefore at-least-once end to end, made safe by the
+idempotent consumer (the unique constraint on `station_id` + `fuel_type` +
+`timestamp`).
